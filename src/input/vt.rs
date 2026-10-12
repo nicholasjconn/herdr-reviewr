@@ -58,7 +58,7 @@ impl VtInput {
     }
 
     /// Nothing more is queued: a lone ESC is the Esc key.
-    fn settle(&mut self) {
+    pub(crate) fn settle(&mut self) {
         self.parse(false);
     }
 
@@ -112,8 +112,37 @@ impl VtInput {
         fed
     }
 
-    pub(super) fn pop(&mut self) -> Option<Event> {
+    pub(crate) fn pop(&mut self) -> Option<Event> {
         self.events.pop_front()
+    }
+
+    pub(crate) fn has_event(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// Raw Unix bytes retain incomplete UTF-8 without consuming the next character on error.
+    pub(crate) fn feed_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.pending.first().is_some_and(|b| *b >= 0xc0) && byte & 0xc0 != 0x80 {
+                self.pending.clear();
+            }
+            self.pending.push(byte);
+            self.parse(true);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn parse_envelope(&mut self, bytes: &[u8]) -> bool {
+        match terminput::Event::parse_from(bytes) {
+            Ok(Some(event)) => {
+                if let Ok(event) = terminput_crossterm::to_crossterm(event) {
+                    self.events.push_back(event);
+                }
+            }
+            Ok(None) => self.pending.extend_from_slice(bytes),
+            Err(_) => return false,
+        }
+        true
     }
 
     /// Try the pending bytes as one event, the step crossterm's unix reader runs per byte.
@@ -134,6 +163,375 @@ impl VtInput {
             Err(_) => self.pending.clear(),
         }
     }
+}
+
+/// Unix framing precedes user-event parsing, including throughout a bracketed paste.
+#[cfg(not(windows))]
+#[derive(Debug, Default)]
+pub(super) struct TerminalInput {
+    user: VtInput,
+    frame: Vec<u8>,
+    state: Frame,
+    deadline: Option<Instant>,
+    replies: VecDeque<Vec<u8>>,
+    keyboard_query: Option<Instant>,
+    keyboard_push: bool,
+    keyboard_enabled: bool,
+    stalled: bool,
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Default, PartialEq, Eq)]
+enum Frame {
+    #[default]
+    Ground,
+    Escape,
+    ControlPrefix {
+        apc: bool,
+    },
+    Csi {
+        malformed: bool,
+        oversized: bool,
+    },
+    String {
+        apc: bool,
+        escaped: bool,
+        oversized: bool,
+    },
+    Paste,
+    DrainString {
+        escaped: bool,
+    },
+    DrainCsi {
+        escaped: bool,
+        malformed: bool,
+    },
+}
+
+#[cfg(not(windows))]
+impl TerminalInput {
+    const ESC_GRACE: Duration = Duration::from_millis(35);
+    const ENVELOPE_GRACE: Duration = Duration::from_millis(250);
+    const MAX_REPLY: usize = 4096;
+    const MAX_REPLIES: usize = 32;
+
+    pub(super) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn discarded_handoff(&self) -> Option<Self> {
+        let state = match self.state {
+            Frame::String { apc: true, escaped, .. } | Frame::DrainString { escaped } => {
+                Frame::DrainString { escaped }
+            }
+            Frame::DrainCsi { malformed, .. } => Frame::DrainCsi { escaped: false, malformed },
+            Frame::Csi { malformed, .. }
+                if self.frame.get(2) == Some(&b'?')
+                    || self.frame.starts_with(b"\x1b[6;")
+                    || self.frame.starts_with(b"\x1b[4;") =>
+            {
+                Frame::DrainCsi { escaped: false, malformed }
+            }
+            _ => return None,
+        };
+        Some(Self { state, stalled: true, ..Self::default() })
+    }
+
+    pub(super) fn query_keyboard(&mut self, now: Instant) {
+        self.keyboard_query = Some(now + Duration::from_secs(1));
+    }
+
+    pub(super) fn keyboard_enabled(&self) -> bool {
+        self.keyboard_enabled
+    }
+
+    pub(super) fn take_keyboard_push(&mut self) -> bool {
+        std::mem::take(&mut self.keyboard_push)
+    }
+
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.deadline.into_iter().chain(self.keyboard_query).min()
+    }
+
+    pub(super) fn expire(&mut self, now: Instant) {
+        if self.keyboard_query.is_some_and(|at| at <= now) {
+            self.keyboard_query = None;
+        }
+        if self.deadline.is_some_and(|at| at <= now) {
+            let draining = matches!(self.state, Frame::String { .. });
+            let escaped = matches!(self.state, Frame::String { escaped: true, .. });
+            let csi_reply = matches!(self.state, Frame::Csi { .. })
+                && (self.frame.get(2) == Some(&b'?')
+                    || self.frame.starts_with(b"\x1b[6;")
+                    || self.frame.starts_with(b"\x1b[4;"));
+            let malformed = matches!(self.state, Frame::Csi { malformed: true, .. });
+            if self.state == Frame::Escape
+                || matches!(
+                    self.state,
+                    Frame::DrainString { escaped: true } | Frame::DrainCsi { escaped: true, .. }
+                )
+            {
+                self.user.feed_bytes(b"\x1b");
+                self.user.settle();
+            }
+            if matches!(self.state, Frame::ControlPrefix { .. }) {
+                self.user.feed_bytes(&self.frame);
+                self.user.settle();
+            }
+            if draining || csi_reply {
+                self.stalled = true;
+            }
+            self.frame.clear();
+            self.state = if draining {
+                Frame::DrainString { escaped }
+            } else if csi_reply {
+                Frame::DrainCsi { escaped: false, malformed }
+            } else {
+                self.stalled = false;
+                Frame::Ground
+            };
+            self.deadline = None;
+            self.user.pending.clear();
+        }
+    }
+
+    pub(super) fn feed(&mut self, bytes: &[u8], now: Instant) {
+        self.expire(now);
+        for &byte in bytes {
+            self.byte(byte, now);
+        }
+    }
+
+    fn byte(&mut self, byte: u8, now: Instant) {
+        match &mut self.state {
+            Frame::Ground => {
+                if byte == 0x1b {
+                    self.user.pending.clear();
+                    self.frame.push(byte);
+                    self.state = Frame::Escape;
+                    self.deadline = Some(now + Self::ESC_GRACE);
+                } else {
+                    self.user.feed_bytes(&[byte]);
+                    self.deadline =
+                        (!self.user.pending.is_empty()).then_some(now + Self::ENVELOPE_GRACE);
+                }
+            }
+            Frame::Escape => {
+                if byte == 0x1b {
+                    self.user.feed_bytes(b"\x1b");
+                    self.user.settle();
+                    self.frame.clear();
+                    self.frame.push(byte);
+                    self.deadline = Some(now + Self::ESC_GRACE);
+                    return;
+                }
+                self.frame.push(byte);
+                self.deadline = Some(now + Self::ENVELOPE_GRACE);
+                match byte {
+                    b'[' => self.state = Frame::Csi { malformed: false, oversized: false },
+                    b'_' | b'P' | b']' | b'^' | b'X' => {
+                        self.state = Frame::ControlPrefix { apc: byte == b'_' };
+                        self.deadline = Some(now + Self::ESC_GRACE);
+                    }
+                    _ => {
+                        self.user.feed_bytes(&self.frame);
+                        self.frame.clear();
+                        self.state = Frame::Ground;
+                        self.deadline =
+                            (!self.user.pending.is_empty()).then_some(now + Self::ENVELOPE_GRACE);
+                    }
+                }
+            }
+            Frame::ControlPrefix { apc } => {
+                if *apc && byte == b'G' {
+                    self.frame.push(byte);
+                    self.state = Frame::String { apc: true, escaped: false, oversized: false };
+                    self.deadline = Some(now + Self::ENVELOPE_GRACE);
+                } else {
+                    self.user.feed_bytes(&self.frame);
+                    self.user.settle();
+                    self.finish();
+                    self.byte(byte, now);
+                }
+            }
+            Frame::DrainCsi { escaped, malformed } => {
+                if *escaped {
+                    self.finish();
+                    self.byte(0x1b, now);
+                    self.byte(byte, now);
+                } else if byte == 0x1b {
+                    *escaped = true;
+                    self.deadline = Some(now + Self::ESC_GRACE);
+                } else if !*malformed && matches!(byte, b'c' | b't' | b'u' | b'n') {
+                    self.finish();
+                } else if !(byte.is_ascii_digit() || matches!(byte, b';' | b':' | b'?' | b'>')) {
+                    *malformed = true;
+                }
+            }
+            Frame::DrainString { escaped } => {
+                if *escaped && byte == b'\\' {
+                    self.finish();
+                } else if *escaped {
+                    self.finish();
+                    self.byte(0x1b, now);
+                    self.byte(byte, now);
+                } else if byte == 0x1b {
+                    *escaped = true;
+                    self.deadline = Some(now + Self::ESC_GRACE);
+                }
+            }
+            Frame::Paste => {
+                self.frame.push(byte);
+                if self.frame.ends_with(b"\x1b[201~") {
+                    self.user.parse_envelope(&self.frame);
+                    self.finish();
+                }
+            }
+            Frame::String { apc, escaped, oversized } => {
+                let end = *escaped && byte == b'\\';
+                let osc_end = self.frame.get(1) == Some(&b']') && byte == 7;
+                *escaped = byte == 0x1b;
+                if self.frame.len() < Self::MAX_REPLY {
+                    self.frame.push(byte);
+                } else {
+                    *oversized = true;
+                }
+                if end || osc_end {
+                    if *apc && !*oversized && valid_apc(&self.frame) {
+                        self.queue_reply();
+                    }
+                    self.finish();
+                }
+            }
+            Frame::Csi { malformed, oversized } => {
+                if self.frame.len() < Self::MAX_REPLY {
+                    self.frame.push(byte);
+                } else {
+                    *oversized = true;
+                }
+                // Linux's legacy F1-F5 prefix has a second '[' before the real final byte.
+                if self.frame == b"\x1b[[" {
+                    return;
+                }
+                if (0x40..=0x7e).contains(&byte) {
+                    if *malformed {
+                        return;
+                    }
+                    if *oversized {
+                        // Oversized numeric replies drain through their final or expiry.
+                        if matches!(byte, b'c' | b't' | b'u' | b'n' | b'~') {
+                            self.finish();
+                        }
+                        return;
+                    }
+                    if self.frame.get(2) == Some(&b'?') && !matches!(byte, b'c' | b'u' | b'n') {
+                        if self.frame[3..self.frame.len() - 1].iter().any(u8::is_ascii_digit) {
+                            self.finish();
+                        } else {
+                            *malformed = true;
+                        }
+                        return;
+                    }
+                    if self.frame == b"\x1b[200~" {
+                        self.state = Frame::Paste;
+                        self.deadline = None;
+                    } else {
+                        if matches!(byte, b'c' | b't' | b'n')
+                            || (byte == b'u' && self.frame.get(2) == Some(&b'?'))
+                        {
+                            self.keyboard_reply(now);
+                            if valid_csi_reply(&self.frame) {
+                                self.queue_reply();
+                            }
+                        } else if !self.user.parse_envelope(&self.frame) {
+                            self.finish();
+                            return;
+                        }
+                        self.finish();
+                        if !self.user.pending.is_empty() {
+                            self.deadline = Some(now + Self::ENVELOPE_GRACE);
+                        }
+                    }
+                } else if !(0x20..=0x3f).contains(&byte) {
+                    *malformed = true;
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        self.stalled = false;
+        self.frame.clear();
+        self.state = Frame::Ground;
+        self.deadline = None;
+    }
+
+    fn queue_reply(&mut self) {
+        if self.replies.len() == Self::MAX_REPLIES {
+            self.replies.pop_front();
+        }
+        self.replies.push_back(self.frame.clone());
+    }
+
+    fn keyboard_reply(&mut self, now: Instant) {
+        if self.frame.starts_with(b"\x1b[?")
+            && self.frame.ends_with(b"u")
+            && self.keyboard_query.is_some_and(|at| now < at)
+            && std::str::from_utf8(&self.frame[3..self.frame.len() - 1])
+                .ok()
+                .and_then(|flags| flags.parse::<u8>().ok())
+                .is_some()
+        {
+            self.keyboard_query = None;
+            self.keyboard_enabled = true;
+            self.keyboard_push = true;
+        }
+    }
+
+    pub(super) fn pop(&mut self) -> Option<Event> {
+        self.user.pop()
+    }
+
+    pub(super) fn has_event(&self) -> bool {
+        self.user.has_event()
+    }
+
+    pub(super) fn has_reply(&self) -> bool {
+        !self.replies.is_empty()
+    }
+
+    pub(super) fn stalled(&self) -> bool {
+        self.stalled
+    }
+
+    pub(super) fn take_reply(&mut self) -> Option<Vec<u8>> {
+        self.replies.pop_front()
+    }
+
+    pub(super) fn resize(&mut self, size: (u16, u16)) {
+        self.user.events.push_back(Event::Resize(size.0, size.1));
+    }
+}
+
+#[cfg(not(windows))]
+fn valid_csi_reply(bytes: &[u8]) -> bool {
+    let params = &bytes[2..bytes.len() - 1];
+    let params = params.strip_prefix(b"?").or_else(|| params.strip_prefix(b">")).unwrap_or(params);
+    !params.is_empty() && params.iter().all(|b| b.is_ascii_digit() || *b == b';' || *b == b':')
+}
+
+#[cfg(not(windows))]
+fn valid_apc(bytes: &[u8]) -> bool {
+    let Some(body) = bytes.strip_prefix(b"\x1b_G").and_then(|b| b.strip_suffix(b"\x1b\\")) else {
+        return false;
+    };
+    let Some(separator) = body.iter().position(|b| *b == b';') else { return false };
+    let (header, tail) = body.split_at(separator);
+    let message = &tail[1..];
+    !header.is_empty()
+        && !message.is_empty()
+        && header.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'=' | b',' | b'-'))
+        && message.iter().all(|b| (0x20..=0x7e).contains(b))
 }
 
 #[cfg(test)]
@@ -364,5 +762,401 @@ mod tests {
         // Input answers for both: after any return the loop drains every worker's channel.
         assert_eq!(vt.poll(&mut console, None).unwrap(), Woke::Input);
         assert_eq!(drain(&mut vt), [key(KeyCode::Char('j'), NONE)]);
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod terminal_tests {
+    use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+
+    fn key(ch: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+    }
+
+    fn drain(input: &mut TerminalInput) -> Vec<Event> {
+        std::iter::from_fn(|| input.pop()).collect()
+    }
+
+    #[test]
+    fn every_reply_split_is_owned_even_when_unsolicited_or_late() {
+        let replies: &[&[u8]] = &[
+            b"\x1b_Gi=27;OK\x1b\\",
+            b"\x1b_Gi=999;ENOENT:not found\x1b\\",
+            b"\x1b[4;600;800t",
+            b"\x1b[6;20;10t",
+            b"\x1b[8;30;80t",
+            b"\x1b[?1;2c",
+            b"\x1b[>1;4000;0c",
+            b"\x1b[?0u",
+            b"\x1b[0n",
+        ];
+        let now = Instant::now();
+        for &reply in replies {
+            for split in 0..=reply.len() {
+                let mut input = TerminalInput::default();
+                input.feed(&reply[..split], now);
+                input.feed(&reply[split..], now + Duration::from_millis(1));
+                input.feed(b"j", now + Duration::from_millis(2));
+                assert_eq!(drain(&mut input), [key('j')], "{reply:?} split {split}");
+                assert_eq!(input.take_reply().as_deref(), Some(reply));
+                assert!(!input.keyboard_enabled());
+            }
+        }
+    }
+
+    #[test]
+    fn esc_deadline_is_armed_once_and_expires_to_a_key() {
+        let now = Instant::now();
+        let mut input = TerminalInput::default();
+        assert_eq!(input.deadline(), None);
+        input.feed(b"\x1b", now);
+        assert_eq!(input.deadline(), Some(now + TerminalInput::ESC_GRACE));
+        input.expire(now + Duration::from_millis(34));
+        assert!(!input.has_event());
+        input.expire(now + TerminalInput::ESC_GRACE);
+        assert_eq!(input.pop(), Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
+        assert_eq!(input.deadline(), None);
+        input.feed(b"j", now + Duration::from_secs(1));
+        assert_eq!(input.pop(), Some(key('j')));
+    }
+
+    #[test]
+    fn paste_owns_apc_csi_and_invalid_utf8_across_large_reads() {
+        let now = Instant::now();
+        let mut body = vec![b'x'; 20_000];
+        body.splice(8180..8180, b"\x1b_Gi=27;OK\x1b\\\x1b[?0u\x1b[6;20;10t\xff".iter().copied());
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"\x1b[201~j");
+        for split in 0..=6 {
+            let mut input = TerminalInput::default();
+            input.feed(&bytes[..split], now);
+            for chunk in bytes[split..].chunks(8192) {
+                input.feed(chunk, now + Duration::from_millis(1));
+            }
+            assert_eq!(
+                drain(&mut input),
+                [Event::Paste(String::from_utf8_lossy(&body).into()), key('j')]
+            );
+            assert_eq!(input.take_reply(), None);
+        }
+        for split in 0..=6 {
+            let mut input = TerminalInput::default();
+            input.feed(b"\x1b[200~\x1b_", now);
+            assert_eq!(input.deadline(), None);
+            input.feed(b"Gi=27;OK\x1b\\", now + Duration::from_mins(1));
+            input.feed(&b"\x1b[201~"[..split], now + Duration::from_secs(61));
+            input.feed(&b"\x1b[201~"[split..], now + Duration::from_secs(62));
+            assert_eq!(input.pop(), Some(Event::Paste("\x1b_Gi=27;OK\x1b\\".into())));
+            assert_eq!(input.take_reply(), None);
+        }
+    }
+
+    #[test]
+    fn malformed_and_oversized_envelopes_discard_without_keys() {
+        let mut oversized_apc = b"\x1b_Gi=27;".to_vec();
+        oversized_apc.extend(vec![b'x'; 10_000]);
+        oversized_apc.extend_from_slice(b"\x1b\\");
+        let mut oversized_csi = b"\x1b[6;".to_vec();
+        oversized_csi.extend(vec![b'1'; 10_000]);
+        oversized_csi.push(b't');
+        let cases: &[&[u8]] = &[
+            &oversized_apc,
+            &oversized_csi,
+            b"\x1b_Gno header\x1b\\",
+            b"\x1b_Gi=2;\xff\x1b\\",
+            b"\x1b[?bad replyu",
+            b"\x1b[6;\xff;2t",
+        ];
+        let now = Instant::now();
+        for &bytes in cases {
+            let mut input = TerminalInput::default();
+            for byte in bytes {
+                input.feed(&[*byte], now);
+                assert!(input.frame.len() <= TerminalInput::MAX_REPLY);
+            }
+            input.expire(now + TerminalInput::ENVELOPE_GRACE);
+            if input.stalled() {
+                input.feed(b"\x1b[A", now + TerminalInput::ENVELOPE_GRACE);
+                let _ = drain(&mut input);
+            }
+            input.feed(b"j", now + TerminalInput::ENVELOPE_GRACE);
+            assert_eq!(drain(&mut input), [key('j')], "{bytes:?}");
+            assert_eq!(input.take_reply(), None);
+        }
+    }
+
+    #[test]
+    fn incomplete_envelopes_have_finite_discard_expiry() {
+        let now = Instant::now();
+        for bytes in [b"\x1b_G".as_slice(), b"\x1b_Gi=12;no end", b"\x1b[?12", b"\x1b[6;12"] {
+            let mut input = TerminalInput::default();
+            input.feed(bytes, now);
+            assert_eq!(input.deadline(), Some(now + TerminalInput::ENVELOPE_GRACE));
+            input.expire(now + TerminalInput::ENVELOPE_GRACE);
+            assert_eq!(input.deadline(), None);
+            assert!(!input.has_event());
+            assert!(input.frame.is_empty());
+            if bytes.starts_with(b"\x1b_") {
+                input.feed(b"Gi=12;OK\x1b\\j", now + Duration::from_secs(1));
+            } else {
+                input.feed(
+                    if bytes.get(2) == Some(&b'?') { b"u" } else { b"t" },
+                    now + Duration::from_secs(1),
+                );
+                input.feed(b"j", now + Duration::from_secs(1));
+            }
+            assert_eq!(input.pop(), Some(key('j')));
+        }
+    }
+
+    #[test]
+    fn a_recognized_reply_keeps_late_suffixes_quarantined_and_escape_recovers() {
+        let now = Instant::now();
+        let reply = b"\x1b_Gi=123;OK\x1b\\";
+        for split in 3..reply.len() {
+            let mut input = TerminalInput::default();
+            input.feed(&reply[..split], now);
+            input.expire(now + TerminalInput::ENVELOPE_GRACE);
+            input.feed(&reply[split..], now + Duration::from_secs(2));
+            assert!(!input.has_event(), "split {split}");
+            input.feed(b"j", now + Duration::from_secs(2));
+            assert_eq!(input.pop(), Some(key('j')));
+        }
+        let mut input = TerminalInput::default();
+        input.feed(b"\x1b_Gnever terminated", now);
+        input.expire(now + TerminalInput::ENVELOPE_GRACE);
+        input.feed(b"\x1b", now + Duration::from_secs(2));
+        input.expire(now + Duration::from_secs(2) + TerminalInput::ESC_GRACE);
+        assert_eq!(input.pop(), Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))));
+        input.feed(b"j", now + Duration::from_secs(3));
+        assert_eq!(input.pop(), Some(key('j')));
+        assert_eq!(input.deadline(), None);
+    }
+
+    #[test]
+    fn late_csi_suffixes_never_become_scope_keys_and_legacy_alt_prefixes_keep_parity() {
+        let now = Instant::now();
+        for reply in [b"\x1b[?1u".as_slice(), b"\x1b[6;20;10t", b"\x1b[?62;22c"] {
+            for split in 4..reply.len() {
+                let mut input = TerminalInput::default();
+                input.feed(&reply[..split], now);
+                input.expire(now + TerminalInput::ENVELOPE_GRACE);
+                input.feed(&reply[split..], now + Duration::from_secs(2));
+                assert!(!input.has_event(), "{reply:?} split {split}");
+                input.feed(b"j", now + Duration::from_secs(2));
+                assert_eq!(input.pop(), Some(key('j')));
+            }
+        }
+        for letter in ['_', 'P', ']', '^', 'X'] {
+            let mut input = TerminalInput::default();
+            input.feed(format!("\x1b{letter}").as_bytes(), now);
+            input.expire(now + TerminalInput::ESC_GRACE);
+            assert_eq!(
+                input.pop(),
+                Some(Event::Key(KeyEvent::new(
+                    KeyCode::Char(letter),
+                    if letter.is_ascii_uppercase() {
+                        KeyModifiers::ALT | KeyModifiers::SHIFT
+                    } else {
+                        KeyModifiers::ALT
+                    }
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn escape_then_another_sequence_preserves_the_key_and_owns_the_response() {
+        let now = Instant::now();
+        for delay in [1, 5, 34] {
+            for bytes in [
+                b"\x1b[A".as_slice(),
+                b"\x1b[<0;10;5M",
+                b"\x1b[O",
+                b"\x1b[200~literal\x1b[201~",
+                b"\x1b_Gi=7;OK\x1b\\",
+                b"\x1b[6;20;10t",
+            ] {
+                let mut input = TerminalInput::default();
+                input.feed(b"\x1b", now);
+                input.feed(bytes, now + Duration::from_millis(delay));
+                assert_eq!(
+                    input.pop(),
+                    Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                );
+                if bytes.starts_with(b"\x1b_G") || bytes.ends_with(b"t") {
+                    assert!(!input.has_event());
+                    assert_eq!(input.take_reply(), Some(bytes.to_vec()));
+                } else {
+                    let expected = terminput_crossterm::to_crossterm(
+                        terminput::Event::parse_from(bytes).unwrap().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(input.pop(), Some(expected));
+                    assert!(!input.has_event());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complete_unknown_csi_does_not_stall_following_typing() {
+        let now = Instant::now();
+        for bytes in [b"\x1b[j".as_slice(), b"\x1b[?2004;1$y", b"\x1b[201~"] {
+            let mut input = TerminalInput::default();
+            input.feed(bytes, now);
+            input.feed(b"k", now + Duration::from_millis(10));
+            assert_eq!(input.pop(), Some(key('k')), "{bytes:?}");
+            assert!(!input.stalled());
+            assert_eq!(input.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn fast_legacy_alt_control_prefixes_keep_typing_without_quarantine() {
+        let now = Instant::now();
+        for prefix in *b"_P]^X" {
+            let mut input = TerminalInput::default();
+            input.feed(&[0x1b, prefix], now);
+            input.feed(b"j", now + Duration::from_millis(10));
+            let expected = terminput_crossterm::to_crossterm(
+                terminput::Event::parse_from(&[0x1b, prefix]).unwrap().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(input.pop(), Some(expected));
+            assert_eq!(input.pop(), Some(key('j')));
+            assert!(!input.stalled());
+            assert_eq!(input.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn editor_epoch_discards_only_a_recognized_response_tail() {
+        let now = Instant::now();
+        for (reply, first_split) in [
+            (b"\x1b_Gi=123;OK\x1b\\".as_slice(), 3),
+            (b"\x1b[?1u".as_slice(), 3),
+            (b"\x1b[6;20;10t".as_slice(), 4),
+        ] {
+            for split in first_split..reply.len() {
+                let mut before = TerminalInput::default();
+                before.feed(b"e", now);
+                before.feed(&reply[..split], now);
+                assert_eq!(before.pop(), Some(key('e')));
+                let mut after = before.discarded_handoff().unwrap();
+                after.query_keyboard(now + Duration::from_secs(2));
+                after.feed(&reply[split..], now + Duration::from_secs(2));
+                after.feed(b"j", now + Duration::from_secs(2));
+                assert_eq!(drain(&mut after), [key('j')]);
+                assert_eq!(after.take_reply(), None);
+                assert!(!after.take_keyboard_push());
+                after.expire(now + Duration::from_secs(4));
+                assert_eq!(after.deadline(), None);
+            }
+        }
+        let mut before = TerminalInput::default();
+        before.feed(b"\x1b", now);
+        assert!(before.discarded_handoff().is_none());
+        before.reset();
+        before.feed(b"\x1b[200~old user paste", now);
+        assert!(before.discarded_handoff().is_none());
+    }
+
+    #[test]
+    fn keyboard_negotiation_needs_a_valid_reply_in_this_epoch() {
+        let now = Instant::now();
+        let mut input = TerminalInput::default();
+        input.query_keyboard(now);
+        input.feed(b"\x1b[?0", now);
+        assert!(!input.take_keyboard_push());
+        input.feed(b"u", now + Duration::from_millis(1));
+        assert!(input.take_keyboard_push());
+        assert!(!input.take_keyboard_push());
+        assert!(input.keyboard_enabled());
+        assert_eq!(input.deadline(), None);
+        input.reset();
+        input.query_keyboard(now);
+        input.feed(b"\x1b[?0u", now + Duration::from_secs(1));
+        assert!(!input.take_keyboard_push());
+        assert!(!input.keyboard_enabled());
+        assert_eq!(input.take_reply(), Some(b"\x1b[?0u".to_vec()));
+        input.reset();
+        input.query_keyboard(now);
+        input.feed(b"\x1b[?bogusu", now);
+        assert!(!input.take_keyboard_push());
+        assert!(!input.has_event());
+    }
+
+    #[test]
+    fn user_events_keep_the_existing_parser_parity_at_every_split() {
+        let now = Instant::now();
+        let rows = [
+            "é",
+            "日",
+            "🙂",
+            "\x1bx",
+            "\x1b[A",
+            "\x1bOD",
+            "\x1b[[A",
+            "\x1b[1;5D",
+            "\x1b[120;3u",
+            "\x1b[106;5:2u",
+            "\x1b[106;5:3u",
+            "\x1b[<0;10;5M",
+            "\x1b[<64;10;5M",
+            "\x1b[M !!",
+            "\x1b[I",
+            "\x1b[O",
+        ];
+        for text in rows {
+            let expected = terminput_crossterm::to_crossterm(
+                terminput::Event::parse_from(text.as_bytes()).unwrap().unwrap(),
+            )
+            .unwrap();
+            for split in 0..=text.len() {
+                let mut input = TerminalInput::default();
+                input.feed(&text.as_bytes()[..split], now);
+                input.feed(&text.as_bytes()[split..], now + Duration::from_millis(1));
+                assert_eq!(
+                    drain(&mut input).as_slice(),
+                    std::slice::from_ref(&expected),
+                    "{text:?} split {split}"
+                );
+                assert_eq!(input.take_reply(), None);
+            }
+        }
+        let mut input = TerminalInput::default();
+        input.feed(b"\xffj\xe2k\xf0\x80\x80\x80l", now);
+        assert_eq!(drain(&mut input), [key('j'), key('k'), key('l')]);
+        input.feed(b"\x1b[<64;10;5M", now);
+        assert!(matches!(input.pop(), Some(Event::Mouse(e)) if e.kind == MouseEventKind::ScrollUp));
+        input.feed(b"\x1b[I\x1b[O", now);
+        assert_eq!(drain(&mut input), [Event::FocusGained, Event::FocusLost]);
+    }
+
+    #[test]
+    fn reply_queue_is_bounded_and_reset_drops_every_kind_of_state() {
+        let now = Instant::now();
+        let mut input = TerminalInput::default();
+        for _ in 0..100 {
+            input.feed(b"\x1b_Gi=12;OK\x1b\\", now);
+        }
+        assert_eq!(input.replies.len(), TerminalInput::MAX_REPLIES);
+        input.query_keyboard(now);
+        input.feed(b"j\x1b[200~unfinished", now);
+        input.resize((80, 24));
+        input.reset();
+        assert!(!input.has_event());
+        assert_eq!(input.deadline(), None);
+        assert_eq!(input.take_reply(), None);
+        input.feed(b"k", now);
+        assert_eq!(drain(&mut input), [key('k')]);
+        input.feed(b"\x1b", now);
+        input.reset();
+        input.expire(now + Duration::from_secs(1));
+        assert!(!input.has_event());
+        assert_eq!(input.user.surrogate, None);
     }
 }

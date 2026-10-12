@@ -133,6 +133,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `:` | Jump to a line number (`:0` first, `:$` last) |
 | `w` | Toggle line wrap |
 | `m` | Flip markdown between rendered and source |
+| `i` | Toggle image preview / metadata |
 | `p` | Rotate navigator |
 | `z` | Hide / show navigator |
 | `<` `>` | Grow / shrink navigator |
@@ -230,6 +231,7 @@ The file accepts these keys:
 theme = "tokyo-night"
 default_scope = "branch"
 markdown_view = "rendered"
+image_view = "preview"
 navigator_position = "right"
 toggle_placement = "overlay"
 toggle_direction = "down"
@@ -273,6 +275,35 @@ start:
 ```toml
 markdown_view = "rendered"
 ```
+
+### Image previews
+
+The **Changes** tab previews changed PNG, JPEG, GIF, and WebP files as a labeled Before/After
+pair when Git reports a binary change. Text diffs, including Git LFS pointers, keep their
+commentable text view. GIF and animated WebP show their first frame; SVG remains a text diff. Previews read the
+exact pinned blob or guarded worktree bytes and never fetch Git LFS content. Images are
+contain-fitted and limited; the original format and dimensions remain visible in the metadata.
+
+`image_view = "metadata"` makes that fallback permanent. The `image-view` keybinding toggles it
+for the current pane (default `i`, rebindable). Returning to preview retries a failed capability query. Valid JPEG EXIF orientation is applied for display;
+metadata keeps the original file dimensions. Transparency is composited on neutral gray;
+embedded color profiles are not transformed.
+A terminal-path Kitty capability query must succeed before graphics are
+emitted; unsupported paths retain the same readable metadata and error messages. The first
+release supports direct terminal/HerdR transport only (not tmux passthrough). An ACK reports
+acceptance by the responding hop, not proof of outer-client pixels. Cell metrics are labelled as
+reported by that hop or estimated at 10×20 pixels. Windows currently provides metadata only; raw worktree sides report a safe-read support error.
+
+Each source is limited to 16 MiB, 8192 pixels on either axis and 8 megapixels; decoder allocations
+are limited to 64 MiB per side. At most one preparation, one pending request, one completed pair,
+and one cached pair are kept; 8-bit display originals are shared rather than copied. Metadata-only views read headers without
+decoding pixel buffers. Prepared RGBA is
+limited to 256 KiB per side (about 700 KiB of base64 for a pair), with no background uploads.
+A recognized reply that expires mid-frame remains quarantined through its terminator;
+`Esc` recovers input if the terminator was lost. Legacy escape prefixes have a 35 ms grace.
+Graphics and keyboard support queries each have a one-second response window; late replies stay
+owned and support is queried again after session reclaim.
+Oversized or undecodable sources show an error and can still be opened in an external editor.
 
 ### Navigator position
 
@@ -363,6 +394,7 @@ The action names and their defaults:
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
 | `rendered` | `m` |
+| `image-view` | `i` |
 | `navigator-position` | `p` |
 | `navigator-hide` | `z` |
 | `navigator-grow` / `navigator-shrink` | `<` / `>` |
