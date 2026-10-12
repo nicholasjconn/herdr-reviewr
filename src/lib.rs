@@ -151,6 +151,18 @@ fn drain_input(app: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Retire graphics IDs only after the serialized cleanup bytes have been flushed.
+fn send_image_cleanup(
+    session: &mut crate::image_session::Session,
+    cleanup: &str,
+    output: &mut impl io::Write,
+) -> io::Result<()> {
+    output.write_all(cleanup.as_bytes())?;
+    output.flush()?;
+    session.cleanup_sent();
+    Ok(())
+}
+
 /// Open a file in the editor: a terminal one takes the pane, a window one is left running.
 fn run_editor(
     terminal: &mut DefaultTerminal,
@@ -213,9 +225,7 @@ fn run_editor(
 
     // A terminal editor gets the pane, and the loop waits it out.
     let cleanup = image_session.invalidate();
-    io::stdout().write_all(cleanup.as_bytes())?;
-    io::stdout().flush()?;
-    image_session.cleanup_sent();
+    send_image_cleanup(image_session, &cleanup, &mut io::stdout().lock())?;
     app.set_image_session_epoch(image_session.epoch);
     app.forget_pointer();
     release_terminal();
@@ -932,9 +942,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 && image_session.hop == crate::image_session::HopGraphics::Rejected
             {
                 let cleanup = image_session.invalidate();
-                io::stdout().write_all(cleanup.as_bytes())?;
-                io::stdout().flush()?;
-                image_session.cleanup_sent();
+                send_image_cleanup(&mut image_session, &cleanup, &mut io::stdout().lock())?;
             }
             while let Some(reply) = input::take_graphics_reply() {
                 image_session.reply(&reply);
@@ -1054,9 +1062,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 app.set_image_graphics_accepted(
                     image_session.hop == crate::image_session::HopGraphics::Accepted,
                 );
-                io::stdout().write_all(cleanup.as_bytes())?;
-                io::stdout().flush()?;
-                image_session.cleanup_sent();
+                send_image_cleanup(&mut image_session, &cleanup, &mut io::stdout().lock())?;
             }
             image_frame_area = Some(area);
             image_layout = Some(regions);
@@ -1119,7 +1125,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                     })
                     .collect();
                 let cleanup = image_session.retain(&ids);
-                io::stdout().write_all(cleanup.as_bytes())?;
+                send_image_cleanup(&mut image_session, &cleanup, &mut io::stdout().lock())?;
                 for id in ids {
                     image_session.adopt(id);
                 }
@@ -1131,14 +1137,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                         app.set_image_graphics_accepted(false);
                         image_frame_area = Some(f.area());
                         image_layout = Some(ui::image_regions(f.area(), app));
-                        if let Err(error) = io::stdout()
-                            .write_all(cleanup.as_bytes())
-                            .and_then(|()| io::stdout().flush())
-                        {
+                        if let Err(error) = send_image_cleanup(
+                            &mut image_session,
+                            &cleanup,
+                            &mut io::stdout().lock(),
+                        ) {
                             cleanup_error = Some(error);
                             return;
                         }
-                        image_session.cleanup_sent();
                     }
                     age_due = ui::render_frame(f, app);
                 });
@@ -1147,11 +1153,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
                 }
                 if let Err(error) = drawn {
                     let cleanup = image_session.invalidate();
-                    let _ = io::stdout().write_all(cleanup.as_bytes());
-                    let _ = io::stdout().flush();
+                    let _ =
+                        send_image_cleanup(&mut image_session, &cleanup, &mut io::stdout().lock());
                     return Err(error.into());
                 }
-                image_session.cleanup_sent();
             }
             let age_due = age_due.map(|due| Instant::now() + due);
 
@@ -1582,9 +1587,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
         Ok(())
     })();
     let cleanup = image_session.cleanup();
-    if io::stdout().write_all(cleanup.as_bytes()).and_then(|()| io::stdout().flush()).is_ok() {
-        image_session.cleanup_sent();
-    }
+    let _ = send_image_cleanup(&mut image_session, &cleanup, &mut io::stdout().lock());
     restore_terminal();
     drain_pr_shutdown(&mut pr, &probe_rx, &pr_rx);
     result
@@ -3768,5 +3771,41 @@ mod refresh_tests {
         assert_eq!(recovery_epoch, epoch);
         assert_eq!(target.theme(), "gruvbox");
         assert_eq!(recovered.plugin_config().unwrap().theme(), "gruvbox");
+    }
+}
+
+#[cfg(test)]
+mod image_cleanup_tests {
+    use super::send_image_cleanup;
+    use std::io::{self, Write};
+
+    struct FailedOutput {
+        flush: bool,
+    }
+
+    impl Write for FailedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.flush { Ok(bytes.len()) } else { Err(io::ErrorKind::BrokenPipe.into()) }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_retired_ids_on_write_or_flush_failure_and_consumes_on_success() {
+        let mut session = crate::image_session::Session::new();
+        session.adopt(17);
+        let cleanup = session.cleanup();
+        for flush in [false, true] {
+            assert!(
+                send_image_cleanup(&mut session, &cleanup, &mut FailedOutput { flush }).is_err()
+            );
+            assert_eq!(session.cleanup(), cleanup);
+        }
+        let mut output = Vec::new();
+        send_image_cleanup(&mut session, &cleanup, &mut output).unwrap();
+        assert_eq!(output, cleanup.as_bytes());
+        assert!(session.cleanup().is_empty());
     }
 }

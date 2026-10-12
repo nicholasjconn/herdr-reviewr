@@ -18,7 +18,6 @@ pub struct Request {
     pub view_key: ViewIdentity,
     pub content_generation: u64,
     pub session_epoch: u64,
-    pub repo: PathBuf,
     pub before: Source,
     pub after: Source,
     pub cells: (u16, u16),
@@ -59,7 +58,9 @@ pub struct ResultPair {
 
 #[derive(Debug, Default)]
 struct State {
-    request: Option<(Request, u64)>,
+    request: Option<Request>,
+    generation: u64,
+    result: Option<ResultPair>,
     closed: bool,
 }
 
@@ -67,8 +68,6 @@ struct State {
 #[derive(Debug)]
 pub struct Worker {
     state: Arc<(Mutex<State>, Condvar)>,
-    result: Arc<Mutex<Option<ResultPair>>>,
-    serial: Arc<std::sync::atomic::AtomicU64>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -76,10 +75,6 @@ impl Worker {
     pub fn new(output: wake::Sender<()>) -> std::io::Result<Self> {
         let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let thread_state = Arc::clone(&state);
-        let result = Arc::new(Mutex::new(None));
-        let thread_result = Arc::clone(&result);
-        let serial = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let worker_serial = Arc::clone(&serial);
         let handle = thread::Builder::new().name("reviewr-image".into()).spawn(move || {
             let mut cached = None;
             loop {
@@ -93,30 +88,39 @@ impl Worker {
                     if state.closed {
                         return;
                     }
-                    state.request.take().expect("request checked")
+                    (state.request.take().expect("request checked"), state.generation)
                 };
-                let current =
-                    || worker_serial.load(std::sync::atomic::Ordering::Acquire) == serial_at;
+                let current = || {
+                    thread_state
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .generation
+                        == serial_at
+                };
                 let Some(built) = build(request, cached.as_ref(), &current) else { continue };
                 cached = Some(built.clone());
-                // One replacement slot bounds completed protocol/image ownership even when
-                // the UI is temporarily gated by a modal or a drag.
-                *thread_result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(built);
+                let mut state =
+                    thread_state.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.generation != serial_at {
+                    continue;
+                }
+                state.result = Some(built);
+                drop(state);
                 if output.send(()).is_err() {
                     return;
                 }
             }
         })?;
-        Ok(Self { state, result, serial, thread: Some(handle) })
+        Ok(Self { state, thread: Some(handle) })
     }
 
     /// Coalesce before work starts; an in-flight decoder is non-preemptible by codec contract.
     pub fn request(&self, request: Request) {
         let (lock, ready) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let serial = self.serial.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-        state.request = Some((request, serial));
+        state.generation = state.generation.wrapping_add(1);
+        state.request = Some(request);
         ready.notify_one();
     }
 
@@ -124,13 +128,13 @@ impl Worker {
     pub fn cancel(&self) {
         let (lock, _) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.serial.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        state.generation = state.generation.wrapping_add(1);
         state.request = None;
     }
 
     /// Consume the newest completed pair. Older completions are intentionally coalesced.
     pub fn take_result(&self) -> Option<ResultPair> {
-        self.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        self.state.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).result.take()
     }
 }
 
@@ -138,7 +142,7 @@ impl Drop for Worker {
     fn drop(&mut self) {
         let (lock, ready) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.serial.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        state.generation = state.generation.wrapping_add(1);
         state.closed = true;
         state.request = None;
         ready.notify_one();
@@ -157,9 +161,9 @@ fn build(
     if !current() {
         return None;
     }
-    let cached = cached.filter(|pair| pair.request.repo == request.repo);
+    let cached = cached.filter(|pair| pair.request.view_key.repo == request.view_key.repo);
     let mut before = read_cached(
-        &request.repo,
+        &request.view_key.repo,
         &request.before,
         cached.map(|p| (&p.request.before, &p.before)),
         request.graphics,
@@ -169,7 +173,7 @@ fn build(
         return None;
     }
     let mut after = read_cached(
-        &request.repo,
+        &request.view_key.repo,
         &request.after,
         cached.map(|p| (&p.request.after, &p.after)),
         request.graphics,
@@ -283,24 +287,17 @@ fn prepare(
         return None;
     }
     let label = side.label();
-    if let Some((old, Some(prepared), epoch)) = cached
-        && matches!(side, Side::Ready(_))
-        && side.provenance() == old.provenance()
-    {
-        if epoch == request.session_epoch {
-            return Some(prepared.clone());
-        }
-        match image_preview::reconstruct(prepared, id) {
-            Ok(prepared) => return Some(prepared),
-            Err(detail) => {
-                let provenance = side.provenance();
-                *side = Side::Error { detail: format!("{label}: {detail}"), provenance };
-                return None;
-            }
-        }
-    }
     let Side::Ready(decoded) = side else { return None };
-    match image_preview::prepare(decoded, id, request.cells.0, request.cells.1, request.metrics) {
+    let result = match cached {
+        Some((old, Some(prepared), epoch)) if decoded.provenance == old.provenance() => {
+            if epoch == request.session_epoch {
+                return Some(prepared.clone());
+            }
+            image_preview::reconstruct(prepared, id)
+        }
+        _ => image_preview::prepare(decoded, id, request.cells.0, request.cells.1, request.metrics),
+    };
+    match result {
         Ok(prepared) => Some(prepared),
         Err(detail) => {
             let provenance = decoded.provenance.clone();

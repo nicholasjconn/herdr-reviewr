@@ -9,16 +9,16 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::Event;
 
-use super::vt::TerminalInput;
+use super::vt::VtInput;
 use crate::wake::{Wake, Woke};
 
 static READER: Mutex<Option<Reader>> = Mutex::new(None);
 static RELEASED_SIZE: Mutex<Option<(u16, u16)>> = Mutex::new(None);
-static RELEASED_PROTOCOL: Mutex<Option<TerminalInput>> = Mutex::new(None);
+static RELEASED_PROTOCOL: Mutex<Option<VtInput>> = Mutex::new(None);
 
 struct Reader {
     file: File,
-    parser: TerminalInput,
+    parser: VtInput,
     resized: Arc<AtomicBool>,
     resize_registration: signal_hook::SigId,
     size: Option<(u16, u16)>,
@@ -36,7 +36,7 @@ impl Reader {
         let resize_registration =
             signal_hook::flag::register(signal_hook::consts::SIGWINCH, Arc::clone(&resized))?;
         let size = terminal_size(&file);
-        Ok(Self { file, parser: TerminalInput::default(), resized, resize_registration, size })
+        Ok(Self { file, parser: VtInput::default(), resized, resize_registration, size })
     }
 
     fn fill(&mut self) -> io::Result<()> {

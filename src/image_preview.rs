@@ -3,7 +3,10 @@
 use image::ImageDecoder;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
 use ratatui::layout::Size;
-use ratatui_image::protocol::{Protocol, kitty::Kitty};
+use ratatui_image::{
+    FontSize, Resize,
+    protocol::{Protocol, kitty::Kitty},
+};
 use std::{io::Cursor, sync::Arc};
 
 /// The largest encoded side admitted from git or the worktree.
@@ -200,39 +203,6 @@ fn decode_mode(bytes: &[u8], provenance: Provenance, pixels: bool) -> Side {
     Side::Ready(Decoded { image: Arc::new(image), format, width, height, provenance })
 }
 
-/// Contain-fit in non-square cells; the source dimensions remain original metadata.
-#[must_use]
-pub fn contain_fit(
-    width: u32,
-    height: u32,
-    available_width: u16,
-    available_height: u16,
-    metrics: (u16, u16),
-) -> (u16, u16) {
-    if width == 0 || height == 0 || available_width == 0 || available_height == 0 {
-        return (0, 0);
-    }
-    let w = available_width.min(MAX_CELLS);
-    let h = available_height.min(MAX_CELLS);
-    let cw = u64::from(metrics.0.max(1));
-    let ch = u64::from(metrics.1.max(1));
-    if u64::from(w) * cw * u64::from(height) <= u64::from(h) * ch * u64::from(width) {
-        (
-            w,
-            u16::try_from(u64::from(height) * u64::from(w) * cw / (u64::from(width) * ch))
-                .unwrap_or(h)
-                .clamp(1, h),
-        )
-    } else {
-        (
-            u16::try_from(u64::from(width) * u64::from(h) * ch / (u64::from(height) * cw))
-                .unwrap_or(w)
-                .clamp(1, w),
-            h,
-        )
-    }
-}
-
 /// Fit and encode off the frame loop; pad to cell geometry and composite alpha on neutral gray.
 pub fn prepare(
     decoded: &Decoded,
@@ -241,34 +211,33 @@ pub fn prepare(
     available_height: u16,
     metrics: (u16, u16),
 ) -> Result<Prepared, String> {
-    let cells = contain_fit(
-        decoded.image.width(),
-        decoded.image.height(),
-        available_width,
-        available_height,
-        metrics,
-    );
-    if cells.0 == 0 || cells.1 == 0 {
+    if available_width == 0
+        || available_height == 0
+        || decoded.image.width() == 0
+        || decoded.image.height() == 0
+    {
         return Err("pane is too small for graphics; enlarge it".into());
     }
-    let target_width = u32::from(cells.0) * u32::from(metrics.0.max(1));
-    let target_height = u32::from(cells.1) * u32::from(metrics.1.max(1));
-    let mut divisor = target_width;
-    let mut remainder = target_height;
-    while remainder != 0 {
-        (divisor, remainder) = (remainder, divisor % remainder);
-    }
-    let unit_width = target_width / divisor;
-    let unit_height = target_height / divisor;
-    let multiple = decoded
-        .image
-        .width()
-        .div_ceil(unit_width)
-        .max(decoded.image.height().div_ceil(unit_height))
-        .min(divisor)
-        .max(1);
-    let mut width = unit_width * multiple;
-    let mut height = unit_height * multiple;
+    let metrics = (metrics.0.max(1), metrics.1.max(1));
+    // The library's proportional fit admits at most u16::MAX pixels per axis.
+    let available = Size::new(
+        available_width.min(MAX_CELLS).min(u16::MAX / metrics.0),
+        available_height.min(MAX_CELLS).min(u16::MAX / metrics.1),
+    );
+    let size = Resize::Scale(None).size_for(
+        &decoded.image,
+        FontSize::new(metrics.0, metrics.1),
+        available,
+    );
+    let cells = (size.width, size.height);
+    // Keep the cell aspect while bounding the encoded pixels independently of pane size.
+    let mut width = u32::from(cells.0) * u32::from(metrics.0.max(1));
+    let mut height = u32::from(cells.1) * u32::from(metrics.1.max(1));
+    let scale = (f64::from(decoded.image.width()) / f64::from(width))
+        .max(f64::from(decoded.image.height()) / f64::from(height))
+        .min(1.0);
+    width = (f64::from(width) * scale).ceil() as u32;
+    height = (f64::from(height) * scale).ceil() as u32;
     while u64::from(width) * u64::from(height) * 4 > MAX_UPLOAD_BYTES {
         width = width.div_ceil(2).max(1);
         height = height.div_ceil(2).max(1);
@@ -285,19 +254,13 @@ pub fn prepare(
                 DynamicImage::ImageRgba8(canvas)
             },
         );
-    let fitted = flattened
-        .as_ref()
-        .unwrap_or(&decoded.image)
-        .resize(width, height, FilterType::Triangle)
-        .to_rgba8();
-    let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba([128, 128, 128, 255]));
-    image::imageops::overlay(
-        &mut canvas,
-        &fitted,
-        i64::from((width - fitted.width()) / 2),
-        i64::from((height - fitted.height()) / 2),
+    let fitted = Resize::Scale(Some(FilterType::Triangle)).resize(
+        flattened.as_ref().unwrap_or(&decoded.image),
+        FontSize::new(1, 1),
+        Size::new(width as u16, height as u16),
+        Some(image::Rgba([128, 128, 128, 255])),
     );
-    encode(Arc::new(DynamicImage::ImageRgba8(canvas)), cells, image_id)
+    encode(Arc::new(fitted), cells, image_id)
 }
 
 /// Reconstruct a fresh protocol from the bounded fitted cache, never a cloned sent flag.
@@ -341,8 +304,27 @@ mod tests {
     }
 
     #[test]
-    fn contain_fit_preserves_aspect_and_the_kitty_bound() {
-        assert_eq!(contain_fit(400, 200, 1000, 1000, (10, 20)), (297, 74));
-        assert_eq!(contain_fit(200, 400, 30, 10, (10, 20)), (10, 10));
+    fn library_fit_preserves_aspect_and_bounds_encoded_pixels() {
+        for (width, height, available, metrics, expected) in [
+            (400, 200, (1000, 1000), (10, 20), (297, 75)),
+            (200, 400, (30, 10), (10, 20), (10, 10)),
+            (8192, 1, (30, 10), (10, 20), (30, 1)),
+            (8192, 1, (1000, 1000), (256, 256), (255, 1)),
+        ] {
+            let decoded = Decoded {
+                image: Arc::new(DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))),
+                format: ImageFormat::Png,
+                width,
+                height,
+                provenance: Provenance::Missing,
+            };
+            let prepared = prepare(&decoded, 1, available.0, available.1, metrics).unwrap();
+            assert_eq!(prepared.cells, expected);
+            assert!(
+                u64::from(prepared.fitted.width()) * u64::from(prepared.fitted.height()) * 4
+                    <= MAX_UPLOAD_BYTES
+            );
+            assert!(prepared.fitted.to_rgba8().pixels().all(|pixel| pixel.0[3] == 255));
+        }
     }
 }

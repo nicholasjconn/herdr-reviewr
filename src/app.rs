@@ -2191,7 +2191,6 @@ impl App {
             view_key: view,
             content_generation: self.image.generation,
             session_epoch,
-            repo: self.repo.clone(),
             before,
             after,
             cells,
@@ -4949,16 +4948,9 @@ impl App {
 }
 
 fn same_image_demand(old: &ImageRequest, new: &ImageRequest) -> bool {
-    old.view_key == new.view_key
-        && old.content_generation == new.content_generation
-        && old.session_epoch == new.session_epoch
-        && old.repo == new.repo
-        && old.before == new.before
-        && old.after == new.after
-        && old.cells == new.cells
-        && old.metrics == new.metrics
-        && old.graphics == new.graphics
-        && old.metrics_estimated == new.metrics_estimated
+    let mut demand = new.clone();
+    demand.ids = old.ids;
+    old == &demand
 }
 
 /// The picker's opening row: the last-sent agent if still listed, else the first.

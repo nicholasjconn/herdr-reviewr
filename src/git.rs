@@ -77,72 +77,23 @@ fn bounded_blob_command(
     limit: usize,
     current: &impl Fn() -> bool,
 ) -> Result<Vec<u8>, GitFail> {
-    use process_wrap::std::CommandWrap;
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::{Duration, Instant};
     if !current() {
         return Err(GitFail("image demand superseded".into()));
     }
     let mut command = git_command(repo);
-    command
-        .args(args)
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut command = CommandWrap::from(command);
-    #[cfg(unix)]
-    command.wrap(process_wrap::std::ProcessGroup::leader());
-    #[cfg(windows)]
-    command.wrap(process_wrap::std::JobObject);
-    let mut child = command.spawn().map_err(|e| GitFail(format!("read image blob: {e}")))?;
-    let stdout = child.stdout().take().expect("piped blob stdout");
-    let reader =
-        match std::thread::Builder::new().name("image-blob-reader".into()).spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
-                .read_to_end(&mut bytes)
-                .map(|_| bytes)
-        }) {
-            Ok(reader) => reader,
-            Err(e) => {
-                let _ = child.start_kill();
-                let _ = child.inner_mut().wait();
-                return Err(GitFail(format!("start image blob reader: {e}")));
-            }
-        };
-    let started = Instant::now();
-    let outcome = loop {
-        if !current() {
-            break Err(GitFail("image demand superseded".into()));
-        }
-        if started.elapsed() >= Duration::from_secs(5) {
-            break Err(GitFail("image blob read timed out".into()));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) if reader.is_finished() => break Ok(status),
-            Ok(Some(_)) => {
-                // An exited leader must not leave a descendant holding the output pipe.
-                let _ = child.start_kill();
-            }
-            Ok(None) => {}
-            Err(e) => break Err(GitFail(format!("wait for image blob: {e}"))),
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    let _ = child.start_kill();
-    let _ = child.inner_mut().wait();
-    let bytes = reader
-        .join()
-        .map_err(|_| GitFail("image blob reader failed".into()))?
-        .map_err(|e| GitFail(format!("read image blob: {e}")))?;
-    if !outcome?.success() || bytes.len() > limit {
-        return Err(GitFail("image blob failed or exceeded preview byte limit".into()));
-    }
-    Ok(bytes)
+    command.args(args).env("GIT_NO_REPLACE_OBJECTS", "1").env("GIT_NO_LAZY_FETCH", "1");
+    let started = std::time::Instant::now();
+    crate::proc::run_tree_bytes(command, Some(limit), || {
+        !current() || started.elapsed() >= std::time::Duration::from_secs(5)
+    })
+    .map_err(|error| {
+        use crate::proc::RunError;
+        GitFail(match error {
+            RunError::Stopped if !current() => "image demand superseded".into(),
+            RunError::Stopped => "image blob read timed out".into(),
+            error => format!("read image blob: {error:?}"),
+        })
+    })
 }
 
 /// Refuse replacement characters conservatively: the existing text path model may be lossy.

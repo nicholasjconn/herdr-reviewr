@@ -102,7 +102,6 @@ fn demand(repo: &std::path::Path, generation: u64, epoch: u64, graphics: bool) -
         },
         content_generation: generation,
         session_epoch: epoch,
-        repo: repo.into(),
         before: Source::Missing,
         after: if cfg!(unix) {
             Source::Worktree { path: "a.png".into() }
