@@ -278,6 +278,12 @@ impl TerminalInput {
                 self.user.feed_bytes(&self.frame);
                 self.user.settle();
             }
+            if self.frame == b"\x1b[" {
+                use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+                self.user
+                    .events
+                    .push_back(Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT)));
+            }
             if draining || csi_reply {
                 self.stalled = true;
             }
@@ -819,6 +825,31 @@ mod terminal_tests {
         assert_eq!(input.deadline(), None);
         input.feed(b"j", now + Duration::from_secs(1));
         assert_eq!(input.pop(), Some(key('j')));
+    }
+
+    #[test]
+    fn bare_csi_prefix_expiry_preserves_the_alt_bracket_chord() {
+        let now = Instant::now();
+        for delay in [0, 1, 5, 34] {
+            let mut input = TerminalInput::default();
+            input.feed(b"\x1b", now);
+            let bracket_at = now + Duration::from_millis(delay);
+            input.feed(b"[", bracket_at);
+            let before_expiry =
+                TerminalInput::ENVELOPE_GRACE.checked_sub(Duration::from_millis(1)).unwrap();
+            input.expire(bracket_at + before_expiry);
+            assert!(!input.has_event());
+            input.expire(bracket_at + TerminalInput::ENVELOPE_GRACE);
+            assert_eq!(
+                drain(&mut input),
+                [Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::ALT))]
+            );
+            assert_eq!(input.deadline(), None);
+            assert!(!input.stalled());
+            assert_eq!(input.take_reply(), None);
+            input.feed(b"j", bracket_at + Duration::from_secs(1));
+            assert_eq!(input.pop(), Some(key('j')));
+        }
     }
 
     #[test]

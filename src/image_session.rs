@@ -163,7 +163,6 @@ impl Session {
     }
 
     pub fn reply(&mut self, bytes: &[u8]) {
-        self.expire_probe();
         if self.pending_metrics.is_some()
             && let Some(body) = bytes.strip_prefix(b"\x1b[6;").and_then(|b| b.strip_suffix(b"t"))
             && let Ok(body) = std::str::from_utf8(body)
@@ -277,6 +276,57 @@ mod tests {
         assert_eq!(session.hop, HopGraphics::Accepted);
         session.adopt(17);
         assert_eq!(session.cleanup(), "\x1b_Ga=d,d=I,i=17,q=2\x1b\\");
+    }
+
+    #[test]
+    fn queued_replies_are_processed_before_probe_expiry() {
+        let at = Instant::now().checked_sub(std::time::Duration::from_secs(2)).unwrap();
+        let mut session = Session::default();
+        session.pending_probe = Some((5, at));
+        session.pending_metrics = Some(at);
+        let queued = [b"\x1b_Gi=5;OK\x1b\\".as_slice(), b"\x1b[6;20;10t"];
+        for reply in queued {
+            session.reply(reply);
+        }
+        session.expire_probe();
+        assert_eq!(session.hop, HopGraphics::Accepted);
+        assert_eq!(session.metrics, CellMetrics::Measured { width: 10, height: 20 });
+        assert_eq!(session.probe_wait(), None);
+    }
+
+    #[test]
+    fn replies_arriving_after_loop_expiry_are_ignored() {
+        let at = Instant::now().checked_sub(std::time::Duration::from_secs(2)).unwrap();
+        let mut session = Session::default();
+        session.pending_probe = Some((5, at));
+        session.pending_metrics = Some(at);
+        session.expire_probe();
+        session.reply(b"\x1b_Gi=5;OK\x1b\\");
+        session.reply(b"\x1b[6;20;10t");
+        assert_eq!(session.hop, HopGraphics::Rejected);
+        assert_eq!(session.metrics, CellMetrics::Estimated);
+        assert_eq!(session.probe_wait(), None);
+    }
+
+    #[test]
+    fn reprobe_ignores_the_old_acknowledgment_and_accepts_the_current_id() {
+        if cfg!(windows) {
+            return;
+        }
+        let mut session = Session::new();
+        session.begin_probe().unwrap();
+        let old_id = session.pending_probe.unwrap().0;
+        session.adopt(old_id);
+        assert!(!session.invalidate().is_empty());
+        session.begin_probe().unwrap();
+        let current_id = session.pending_probe.unwrap().0;
+        assert_ne!(current_id, old_id);
+        session.reply(format!("\x1b_Gi={old_id};OK\x1b\\").as_bytes());
+        assert_eq!(session.hop, HopGraphics::Unknown);
+        assert_eq!(session.pending_probe.unwrap().0, current_id);
+        session.reply(format!("\x1b_Gi={current_id};OK\x1b\\").as_bytes());
+        assert_eq!(session.hop, HopGraphics::Accepted);
+        assert_eq!(session.pending_probe, None);
     }
 
     #[test]
