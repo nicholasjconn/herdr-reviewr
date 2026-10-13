@@ -3,9 +3,10 @@ mod common;
 
 use common::Repo;
 use herdr_reviewr::app::Tab;
+#[cfg(unix)]
+use herdr_reviewr::git::image_path_is_exact;
 use herdr_reviewr::git::{
-    blob_bytes, changed_between, changed_from, guarded_worktree_bytes, image_path_is_exact,
-    snapshot_worktree,
+    blob_bytes, changed_between, changed_from, guarded_worktree_bytes, snapshot_worktree,
 };
 use herdr_reviewr::model::{ChangeKind, CommitPick, Scope};
 use herdr_reviewr::world::{Changeset, WorldInput, build_changed};
