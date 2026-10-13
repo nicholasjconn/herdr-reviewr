@@ -15,7 +15,7 @@ pub const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_DIMENSION: u32 = 8_192;
 /// The decoded image is limited independently of its encoded size.
 pub const MAX_PIXELS: u64 = 8 * 1024 * 1024;
-/// Decoder allocations are capped before normalizing display originals to eight-bit RGBA.
+/// Best-effort decoder allocation budget, separate from source and display-pixel bounds.
 pub const MAX_DECODED_BYTES: u64 = MAX_PIXELS * 8;
 /// A prepared side cannot put more than this many RGBA bytes on the terminal wire.
 pub const MAX_UPLOAD_BYTES: u64 = 256 * 1024;

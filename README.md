@@ -294,8 +294,9 @@ release supports direct terminal/HerdR transport only (not tmux passthrough). An
 acceptance by the responding hop, not proof of outer-client pixels. Cell metrics are labelled as
 reported by that hop or estimated at 10×20 pixels. Windows currently provides metadata only; raw worktree sides report a safe-read support error.
 
-Each source is limited to 16 MiB, 8192 pixels on either axis and 8 megapixels; decoder allocations
-are limited to 64 MiB per side. At most one preparation, one pending request, one completed pair,
+Each source is limited to 16 MiB, 8192 pixels on either axis and 8 megapixels. Decoders receive
+a best-effort 64 MiB allocation budget per side; this is not a hard process-memory limit.
+At most one preparation, one pending request, one completed pair,
 and one cached pair are kept; 8-bit display originals are shared rather than copied. Metadata-only views read headers without
 decoding pixel buffers. Prepared RGBA is
 limited to 256 KiB per side (about 700 KiB of base64 for a pair), with no background uploads.
@@ -547,7 +548,8 @@ The known constraints:
   number. reviewr flags a stale comment instead of dropping it.
 
 **Budgets**
-- Files over 2 MB or 50,000 lines show a "too large" notice. Binary files get no diff.
+- Text files over 2 MB or 50,000 lines show a "too large" notice. Binary files have no text diff;
+  supported raster changes have Before/After previews or metadata.
 
 ## Building from source
 
