@@ -130,11 +130,13 @@ impl VtInput {
         self.events.pop_front()
     }
 
+    #[cfg(not(windows))]
     pub(crate) fn has_event(&self) -> bool {
         !self.events.is_empty()
     }
 
     /// Raw Unix bytes retain incomplete UTF-8 without consuming the next character on error.
+    #[cfg(not(windows))]
     pub(crate) fn feed_bytes(&mut self, bytes: &[u8]) {
         for &byte in bytes {
             if self.pending.first().is_some_and(|b| *b >= 0xc0) && byte & 0xc0 != 0x80 {
