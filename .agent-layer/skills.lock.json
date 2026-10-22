@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "skills": [
+    {
+      "name": "dispatch-agent",
+      "repository": "https://github.com/conn-castle/agent-layer.git",
+      "selector": "internal/templates/skills-catalog/dispatch-agent",
+      "selected_path": "internal/templates/skills-catalog/dispatch-agent",
+      "configured_ref": "v0.24.3",
+      "resolved_ref": "v0.24.3",
+      "ref_kind": "tag",
+      "tracking": "pinned",
+      "commit": "f056182d4f761690017d8f572d732e62100d236d",
+      "tree_hash": "sha256:f95dd6bb6a8d8cb710fb0eb16c7f2e810759840a0ba7c9cc203cd1aa358823bf"
+    },
+    {
+      "name": "implement",
+      "repository": "https://github.com/nicholasjconn/skills.git",
+      "selector": "skills/development/implement",
+      "selected_path": "skills/development/implement",
+      "configured_ref": "main",
+      "resolved_ref": "main",
+      "ref_kind": "branch",
+      "tracking": "tracked",
+      "commit": "110750f7b6e6e4033ceb378d5bcaf30905495d9e",
+      "tree_hash": "sha256:6cc6ab8f4d1133e8a500cd7f54e585781bf1378981cbeb4a1849df383ad7a1d9"
+    },
+    {
+      "name": "ship-pr",
+      "repository": "https://github.com/nicholasjconn/skills.git",
+      "selector": "skills/development/ship-pr",
+      "selected_path": "skills/development/ship-pr",
+      "configured_ref": "main",
+      "resolved_ref": "main",
+      "ref_kind": "branch",
+      "tracking": "tracked",
+      "commit": "110750f7b6e6e4033ceb378d5bcaf30905495d9e",
+      "tree_hash": "sha256:0f87a1eeb415c33ae505dff95e5d8cbb25c4413d72e3bf6a7c577af18a87c06a"
+    }
+  ]
+}
